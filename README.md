@@ -3,11 +3,11 @@ FreePBX Agent UI (FOP2‑lite)
 A lightweight agent UI for FreePBX: queue login/logout/pause per queue, live calls in queue, SLA dashboard with custom per‑queue rules, and agent “today” stats (inbound/outbound/ATT/available time). Works with FreePBX 15, Asterisk AMI, and MariaDB (CDR + Q‑Xact tables).
 
 One‑liner install (Debian/Ubuntu/RHEL)
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/<YOUR_GITHUB>/<YOUR_REPO>/main/install_freepbx_agent_ui.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SDenbow/freepbx-agent-ui/main/install_freepbx_agent_ui.sh)"
 
 Or:
 
-wget -O install_freepbx_agent_ui.sh https://raw.githubusercontent.com/<YOUR_GITHUB>/<YOUR_REPO>/main/install_freepbx_agent_ui.sh \
+wget -O install_freepbx_agent_ui.sh https://raw.githubusercontent.com/SDenbow/freepbx-agent-ui/main/install_freepbx_agent_ui.sh \
   && sudo bash install_freepbx_agent_ui.sh
 What you’ll need during install
 
