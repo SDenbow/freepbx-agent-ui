@@ -2,14 +2,12 @@
 set -euo pipefail
 
 # ==============================================================================
-# FreePBX Agent UI (FOP2-lite) — Interactive Installer
-# Target: Debian/Ubuntu (apt based). Should also work on most systemd distros.
-# This script:
-#  - Prompts for AMI/MySQL/JWT/app settings
-#  - Lays down Node.js app (server + React web) from templates
-#  - Installs Node.js (Node 20 LTS via NodeSource) and builds everything
-#  - Creates a systemd service for the API (WebSocket included)
-#  - Optionally installs Nginx reverse proxy for web + /api + /ws
+# FreePBX Agent UI (FOP2-lite) — Clean Installer
+# - Replaces asterisk-ami-client with asterisk-manager
+# - Creates service user with HOME; runs npm with correct HOME
+# - Generates server + web apps, builds web, creates systemd service
+# - Optional Nginx reverse proxy to serve web + /api + /ws
+# Target: Debian/Ubuntu (apt) and RHEL/CentOS/Alma/Rocky (dnf/yum)
 # ==============================================================================
 
 red()   { printf "\033[31m%s\033[0m\n" "$*"; }
@@ -24,7 +22,7 @@ need_root() {
   fi
 }
 
-detect_distro() {
+detect_pkg() {
   if command -v apt >/dev/null 2>&1; then
     PKG=apt
   elif command -v dnf >/dev/null 2>&1; then
@@ -39,7 +37,7 @@ detect_distro() {
 
 ask() {
   local prompt default var
-  prompt="$1"; default="${2:-}"; var=""
+  prompt="$1"; default="${2:-}"
   if [[ -n "$default" ]]; then
     read -r -p "$prompt [$default]: " var || true
     echo "${var:-$default}"
@@ -69,44 +67,65 @@ confirm() {
   [[ "$yn" =~ ^[Yy]$ ]]
 }
 
-# ---------- Prereqs ----------
 need_root
-detect_distro
+detect_pkg
 
+# ----------------------- Prereqs -----------------------
 cyan "==> Installing prerequisites..."
-if [[ "$PKG" == "apt" ]]; then
-  apt update -y
-  apt install -y curl git build-essential ca-certificates
-elif [[ "$PKG" == "dnf" ]]; then
-  dnf install -y curl git @development-tools ca-certificates
+case "$PKG" in
+  apt)
+    apt update -y
+    apt install -y curl git ca-certificates build-essential
+    ;;
+  dnf)
+    dnf install -y curl git ca-certificates @development-tools
+    ;;
+  yum)
+    yum install -y curl git ca-certificates @development-tools
+    ;;
+esac
+
+# Node.js (v20) if missing
+if ! command -v node >/dev/null 2>&1; then
+  cyan "==> Installing Node.js 20 LTS..."
+  case "$PKG" in
+    apt)
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt install -y nodejs
+      ;;
+    dnf|yum)
+      curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+      $PKG install -y nodejs
+      ;;
+  esac
 else
-  yum install -y curl git @development-tools ca-certificates
+  yellow "Node found: $(node -v)"
 fi
 
-# ---------- Gather config ----------
-cyan "==> Answer a few questions to configure the app."
+# ----------------------- Questions -----------------------
+cyan "==> Installer configuration"
 
 INSTALL_DIR=$(ask "Install directory" "/opt/freepbx-agent-ui")
 APP_USER=$(ask "Run-as system user" "freepbxui")
 APP_GROUP="$APP_USER"
 
 APP_PORT=$(ask "API port (Node server)" "8088")
-ALLOWED_ORIGIN=$(ask "Allowed web origin (for CORS; e.g., http://ui.example.com or http://localhost:5173)" "http://localhost:5173")
-JWT_SECRET=$(ask_secret "JWT secret (for issuing/validating tokens)")
-SERVER_TZ=$(ask "Server timezone (for queries)" "America/New_York")
+ALLOWED_ORIGIN=$(ask "Allowed web origin (CORS; e.g., http://ui.example.com or http://localhost:5173)" "http://localhost:5173")
+JWT_SECRET=$(ask_secret "JWT secret (for signing JWTs)")
+SERVER_TZ=$(ask "Server timezone" "America/New_York")
 
-AMI_HOST=$(ask "Asterisk AMI host/IP" "127.0.0.1")
+AMI_HOST=$(ask "Asterisk AMI host/IP (your FreePBX box IP)" "127.0.0.1")
 AMI_PORT=$(ask "Asterisk AMI port" "5038")
-AMI_USER=$(ask "Asterisk AMI username" "ui_agent_app")
+AMI_USER_NAME=$(ask "Asterisk AMI username" "ui_agent_app")
 AMI_PASS=$(ask_secret "Asterisk AMI password")
 
-MYSQL_HOST=$(ask "MySQL host" "127.0.0.1")
+MYSQL_HOST=$(ask "MySQL host (FreePBX DB host)" "127.0.0.1")
 MYSQL_PORT=$(ask "MySQL port" "3306")
-MYSQL_DB=$(ask "MySQL database (FreePBX CDR/QXact)" "asteriskcdrdb")
+MYSQL_DB=$(ask "MySQL database (FreePBX CDR/QXact DB)" "asteriskcdrdb")
 MYSQL_USER=$(ask "MySQL read-only user" "report_ro")
 MYSQL_PASS=$(ask_secret "MySQL read-only password")
 
-DEVICE_TEMPLATE=$(ask "Member interface template (use {ext} placeholder)" "PJSIP/{ext}")
+DEVICE_TEMPLATE=$(ask "Member interface template (use {ext}, e.g., PJSIP/{ext} or SIP/{ext} or Local/{ext}@from-queue/n)" "PJSIP/{ext}")
 
 cyan "==> Configure per-queue SLA rules"
 read -r -p "How many queues to configure? [2]: " QN || true
@@ -123,9 +142,9 @@ done
 QUEUE_JSON+="}"
 
 INSTALL_NGINX=false
-if confirm "Install and configure Nginx reverse proxy (serve web + proxy /api and /ws)?"; then
+if confirm "Install and configure Nginx to serve the web UI and proxy /api and /ws?"; then
   INSTALL_NGINX=true
-  NGINX_SERVER_NAME=$(ask "  Public hostname for UI (server_name)" "agent-ui.local")
+  NGINX_SERVER_NAME=$(ask "  Public hostname (server_name)" "agent-ui.local")
   NGINX_LISTEN_PORT=$(ask "  Nginx HTTP listen port" "80")
   PUBLIC_SCHEME=$(ask "  Public scheme for VITE_API (http/https)" "http")
   PUBLIC_PORT=$(ask "  Public port for VITE_API" "$NGINX_LISTEN_PORT")
@@ -138,41 +157,30 @@ else
   VITE_API="http://localhost:${APP_PORT}"
 fi
 
-# ---------- Create user & directories ----------
-cyan "==> Creating user and directories..."
-id -u "$APP_USER" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin "$APP_USER"
-mkdir -p "$INSTALL_DIR"
+# ----------------------- User & dirs -----------------------
+cyan "==> Creating service user and directories"
+if ! id -u "$APP_USER" >/dev/null 2>&1; then
+  useradd -r -m -s /usr/sbin/nologin "$APP_USER"
+fi
+HOMEDIR=$(getent passwd "$APP_USER" | cut -d: -f6)
+[ -d "$HOMEDIR" ] || { mkdir -p "$HOMEDIR"; chown -R "$APP_USER:$APP_GROUP" "$HOMEDIR"; }
+
+mkdir -p "$INSTALL_DIR/server/src" "$INSTALL_DIR/web/src/components"
 chown -R "$APP_USER:$APP_GROUP" "$INSTALL_DIR"
 
-# ---------- Install Node.js 20 LTS ----------
-cyan "==> Installing Node.js 20 LTS..."
-if [[ "$PKG" == "apt" ]]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt install -y nodejs
-elif [[ "$PKG" == "dnf" ]]; then
-  curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-  dnf install -y nodejs
-else
-  curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-  yum install -y nodejs
-fi
-
-# ---------- Scaffold project ----------
-cyan "==> Scaffolding project files..."
-mkdir -p "$INSTALL_DIR/server/src" "$INSTALL_DIR/web/src/components"
-
-# server/package.json
+# ----------------------- Scaffold: SERVER -----------------------
+cyan "==> Scaffolding server"
 cat > "$INSTALL_DIR/server/package.json" <<'JSON'
 {
   "name": "freepbx-agent-ui-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js"
   },
   "dependencies": {
-    "asterisk-ami-client": "^0.5.2",
+    "asterisk-manager": "^0.2.0",
     "dotenv": "^16.4.5",
     "fastify": "^4.28.1",
     "fastify-cors": "^8.4.2",
@@ -183,7 +191,6 @@ cat > "$INSTALL_DIR/server/package.json" <<'JSON'
 }
 JSON
 
-# server/.env
 cat > "$INSTALL_DIR/server/.env" <<ENV
 PORT=${APP_PORT}
 JWT_SECRET=${JWT_SECRET}
@@ -191,7 +198,7 @@ ALLOWED_ORIGIN=${ALLOWED_ORIGIN}
 
 AMI_HOST=${AMI_HOST}
 AMI_PORT=${AMI_PORT}
-AMI_USER=${AMI_USER}
+AMI_USER=${AMI_USER_NAME}
 AMI_PASS=${AMI_PASS}
 
 MYSQL_HOST=${MYSQL_HOST}
@@ -203,19 +210,17 @@ MYSQL_DB=${MYSQL_DB}
 TZ=${SERVER_TZ}
 ENV
 
-# server/src/config.js
 cat > "$INSTALL_DIR/server/src/config.js" <<CFG
 export const DEVICE_TEMPLATE = (ext) => \`${DEVICE_TEMPLATE}\`.replace('{ext}', ext);
 
 export const QUEUE_RULES = ${QUEUE_JSON};
 
-// MVP user access: allow any ext to see all queues; tighten later or replace with DB/UserMan.
+// MVP: allow any ext to see all queues; replace with DB/UserMan later
 export const USER_ACCESS = new Proxy({}, {
   get: (_, ext) => ({ queues: Object.keys(QUEUE_RULES), ext })
 });
 CFG
 
-# server/src/db.js
 cat > "$INSTALL_DIR/server/src/db.js" <<'JS'
 import mysql from 'mysql2/promise';
 
@@ -236,53 +241,65 @@ export function getPool() {
 }
 JS
 
-# server/src/ami.js
+# --- New AMI adapter using asterisk-manager ---
 cat > "$INSTALL_DIR/server/src/ami.js" <<'JS'
-import AsteriskAmi from 'asterisk-ami-client';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const AsteriskManager = require('asterisk-manager');
 
-const client = new AsteriskAmi({ reconnect: true, keepAlive: true });
-let connected = false;
+let client;
 
 export async function connectAMI() {
-  if (connected) return client;
-  await client.connect(process.env.AMI_USER, process.env.AMI_PASS, {
-    host: process.env.AMI_HOST,
-    port: +process.env.AMI_PORT,
-    keepAlive: true
-  });
-  connected = true;
+  if (client) return client;
+  const host = process.env.AMI_HOST;
+  const port = +process.env.AMI_PORT || 5038;
+  const user = process.env.AMI_USER;
+  const pass = process.env.AMI_PASS;
+  client = new AsteriskManager(port, host, user, pass, true);
+  client.keepConnected();
   return client;
 }
 
-export function onAMI(event, handler) {
-  client.on(event, handler);
+function action(payload) {
+  return new Promise((resolve, reject) => {
+    client.action(payload, (err, res) => (err ? reject(err) : resolve(res)));
+  });
 }
 
 export async function queueAdd({ queue, iface, penalty = 0, paused = false }) {
-  return client.action({ action: 'QueueAdd', queue, interface: iface, penalty, paused });
+  return action({
+    Action: 'QueueAdd',
+    Queue: queue,
+    Interface: iface,
+    Penalty: String(penalty),
+    Paused: paused ? 'true' : 'false',
+  });
 }
 export async function queueRemove({ queue, iface }) {
-  return client.action({ action: 'QueueRemove', queue, interface: iface });
+  return action({ Action: 'QueueRemove', Queue: queue, Interface: iface });
 }
 export async function queuePause({ queue, iface, paused, reason }) {
-  return client.action({ action: 'QueuePause', queue, interface: iface, paused, reason });
+  return action({
+    Action: 'QueuePause',
+    Queue: queue,
+    Interface: iface,
+    Paused: paused ? 'true' : 'false',
+    Reason: reason || ''
+  });
 }
 export async function queueStatus() {
-  return client.action({ action: 'QueueStatus' });
+  return action({ Action: 'QueueStatus' });
 }
 
-export const state = {
-  queues: new Map(),
-};
-
+export const state = { queues: new Map() };
 function ensureQueue(name) {
   if (!state.queues.has(name)) state.queues.set(name, { entries: new Map(), members: new Map() });
   return state.queues.get(name);
 }
 
 export function wireQueueEvents(broadcast) {
-  client.on('event', (e) => {
-    const type = e.Event;
+  client.on('managerevent', (e) => {
+    const type = e.event || e.Event;
     if (!type) return;
 
     if (type === 'QueueParams') {
@@ -290,17 +307,19 @@ export function wireQueueEvents(broadcast) {
     }
     if (type === 'QueueEntry') {
       const q = ensureQueue(e.Queue);
-      q.entries.set(e.Uniqueid || `${e.Position}-${e.CallerIDNum}`, {
+      const key = e.Uniqueid || `${e.Position}-${e.CallerIDNum}`;
+      q.entries.set(key, {
         callerid: e.CallerIDNum,
-        position: +e.Position,
-        wait: +e.Wait,
-        queue: e.Queue
+        position: Number(e.Position),
+        wait: Number(e.Wait),
+        queue: e.Queue,
       });
       broadcast({ t: 'queue_entry', data: { queue: e.Queue } });
     }
     if (type === 'QueueEntryRemove' || type === 'QueueCallerAbandon') {
       const q = ensureQueue(e.Queue);
-      q.entries.delete(e.Uniqueid || `${e.Position}-${e.CallerIDNum}`);
+      const key = e.Uniqueid || `${e.Position}-${e.CallerIDNum}`;
+      q.entries.delete(key);
       broadcast({ t: 'queue_entry', data: { queue: e.Queue } });
     }
     if (type === 'QueueMember' || type === 'QueueMemberAdded' || type === 'QueueMemberRemoved') {
@@ -311,9 +330,9 @@ export function wireQueueEvents(broadcast) {
         q.members.set(e.Interface, {
           iface: e.Interface,
           status: e.Status,
-          paused: e.Paused === '1',
+          paused: e.Paused === '1' || e.Paused === 'true',
           name: e.MemberName,
-          penalty: e.Penalty
+          penalty: e.Penalty,
         });
       }
       broadcast({ t: 'queue_member', data: { queue: e.Queue } });
@@ -322,7 +341,6 @@ export function wireQueueEvents(broadcast) {
 }
 JS
 
-# server/src/sla.js
 cat > "$INSTALL_DIR/server/src/sla.js" <<'JS'
 import { getPool } from './db.js';
 import { QUEUE_RULES } from './config.js';
@@ -364,7 +382,6 @@ export async function getSLA({ queue, from, to }) {
 }
 JS
 
-# server/src/agentStats.js
 cat > "$INSTALL_DIR/server/src/agentStats.js" <<'JS'
 import { getPool } from './db.js';
 
@@ -378,7 +395,6 @@ export function dayWindow(dateStr) {
 export async function getAgentToday({ ext, from, to }) {
   const pool = getPool();
 
-  // NOTE: You may want to refine inbound detection depending on dialplan
   const [cdr] = await pool.query(
     `SELECT 
        SUM(CASE WHEN dcontext LIKE 'from-internal%' THEN (disposition='ANSWERED') ELSE 0 END) AS outbound_answered,
@@ -423,7 +439,6 @@ export async function getAgentToday({ ext, from, to }) {
 }
 JS
 
-# server/src/auth.js
 cat > "$INSTALL_DIR/server/src/auth.js" <<'JS'
 export function buildAuth(fastify) {
   fastify.register(import('fastify-jwt'), { secret: process.env.JWT_SECRET });
@@ -446,7 +461,6 @@ export function buildAuth(fastify) {
 }
 JS
 
-# server/src/wsHub.js
 cat > "$INSTALL_DIR/server/src/wsHub.js" <<'JS'
 import { WebSocketServer } from 'ws';
 import { state } from './ami.js';
@@ -486,7 +500,6 @@ export function createWsServer(server) {
 }
 JS
 
-# server/src/index.js
 cat > "$INSTALL_DIR/server/src/index.js" <<'JS'
 import 'dotenv/config';
 import Fastify from 'fastify';
@@ -516,7 +529,7 @@ fastify.get('/api/queues', async (req, reply) => {
 });
 
 fastify.post('/api/queue/login', async (req, reply) => {
-  const { queue } = req.body;
+  const { queue } = req.body || {};
   const { ext } = req.user;
   const iface = DEVICE_TEMPLATE(ext);
   await queueAdd({ queue, iface, penalty: 0, paused: false });
@@ -524,7 +537,7 @@ fastify.post('/api/queue/login', async (req, reply) => {
 });
 
 fastify.post('/api/queue/logout', async (req, reply) => {
-  const { queue } = req.body;
+  const { queue } = req.body || {};
   const { ext } = req.user;
   const iface = DEVICE_TEMPLATE(ext);
   await queueRemove({ queue, iface });
@@ -532,7 +545,7 @@ fastify.post('/api/queue/logout', async (req, reply) => {
 });
 
 fastify.post('/api/queue/pause', async (req, reply) => {
-  const { queue, reason } = req.body;
+  const { queue, reason } = req.body || {};
   const { ext } = req.user;
   const iface = DEVICE_TEMPLATE(ext);
   await queuePause({ queue, iface, paused: true, reason: reason || 'Break' });
@@ -540,7 +553,7 @@ fastify.post('/api/queue/pause', async (req, reply) => {
 });
 
 fastify.post('/api/queue/unpause', async (req, reply) => {
-  const { queue } = req.body;
+  const { queue } = req.body || {};
   const { ext } = req.user;
   const iface = DEVICE_TEMPLATE(ext);
   await queuePause({ queue, iface, paused: false });
@@ -548,13 +561,13 @@ fastify.post('/api/queue/unpause', async (req, reply) => {
 });
 
 fastify.get('/api/stats/sla', async (req, reply) => {
-  const { queue, from, to } = req.query;
+  const { queue, from, to } = req.query || {};
   if (!queue || !from || !to) return reply.code(400).send({ error: 'queue, from, to required' });
   return getSLA({ queue, from, to });
 });
 
 fastify.get('/api/stats/agentToday', async (req, reply) => {
-  const { date } = req.query;
+  const { date } = req.query || {};
   const { ext } = req.user;
   const { from, end } = dayWindow(date);
   return getAgentToday({ ext, from, to: end });
@@ -577,11 +590,12 @@ start().catch((e) => {
 });
 JS
 
-# web/package.json
+# ----------------------- Scaffold: WEB -----------------------
+cyan "==> Scaffolding web"
 cat > "$INSTALL_DIR/web/package.json" <<'JSON'
 {
   "name": "freepbx-agent-ui-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -600,7 +614,6 @@ cat > "$INSTALL_DIR/web/package.json" <<'JSON'
 }
 JSON
 
-# web/vite.config.js
 cat > "$INSTALL_DIR/web/vite.config.js" <<'JS'
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
@@ -610,12 +623,10 @@ export default defineConfig({
 });
 JS
 
-# web/.env (for Vite)
 cat > "$INSTALL_DIR/web/.env" <<ENV
 VITE_API=${VITE_API}
 ENV
 
-# web/src files
 cat > "$INSTALL_DIR/web/index.html" <<'HTML'
 <!doctype html>
 <html>
@@ -635,14 +646,12 @@ cat > "$INSTALL_DIR/web/src/api.js" <<'JS'
 const API = import.meta.env.VITE_API || 'http://localhost:8088';
 let token = localStorage.getItem('token') || '';
 export function setToken(t){ token=t; localStorage.setItem('token', t); }
-
 async function req(path, opts={}){
   const headers = { 'Content-Type': 'application/json', ...(token?{Authorization:`Bearer ${token}`}:{}) };
   const res = await fetch(`${API}${path}`, { ...opts, headers });
   if(!res.ok) throw new Error(await res.text());
   return res.json();
 }
-
 export const api = {
   login: (ext)=> req('/api/login', { method:'POST', body: JSON.stringify({ ext }) }),
   myQueues: ()=> req('/api/queues'),
@@ -653,7 +662,6 @@ export const api = {
   sla: (queue, from, to)=> req(`/api/stats/sla?queue=${encodeURIComponent(queue)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
   agentToday: (date)=> req(`/api/stats/agentToday?date=${encodeURIComponent(date||'')}`)
 };
-
 export function wsURL(){ return `${API.replace('http','ws').replace('/api','')}/ws`; }
 JS
 
@@ -816,111 +824,20 @@ import App from './App';
 createRoot(document.getElementById('root')).render(<App/>);
 JSX
 
-# ---------- Install dependencies & build ----------
-cyan "==> Installing Node dependencies & building..."
+# ----------------------- Install deps & build -----------------------
+cyan "==> Installing dependencies & building"
+
+chown -R "$APP_USER:$APP_GROUP" "$INSTALL_DIR"
+
 cd "$INSTALL_DIR/server"
-sudo -u "$APP_USER" npm install --omit=dev
+sudo -u "$APP_USER" env HOME="$HOMEDIR" npm install --omit=dev
 
 cd "$INSTALL_DIR/web"
-sudo -u "$APP_USER" npm install
-sudo -u "$APP_USER" npm run build
+sudo -u "$APP_USER" env HOME="$HOMEDIR" npm install
+sudo -u "$APP_USER" env HOME="$HOMEDIR" npm run build
 
-# Optionally serve the built web with Nginx (recommended)
-if $INSTALL_NGINX; then
-  cyan "==> Installing & configuring Nginx..."
-  if [[ "$PKG" == "apt" ]]; then
-    apt install -y nginx
-  elif [[ "$PKG" == "dnf" ]]; then
-    dnf install -y nginx
-    systemctl enable nginx
-    systemctl start nginx
-  else
-    yum install -y nginx
-    systemctl enable nginx
-    systemctl start nginx
-  fi
-
-  # Create a static site root
-  WEBROOT="/var/www/freepbx-agent-ui"
-  rm -rf "$WEBROOT"
-  mkdir -p "$WEBROOT"
-  cp -r "$INSTALL_DIR/web/dist/"* "$WEBROOT/"
-  chown -R "$APP_USER:$APP_GROUP" "$WEBROOT"
-
-  # Nginx site
-  NCONF="/etc/nginx/sites-available/freepbx-agent-ui.conf"
-  if [[ -d /etc/nginx/sites-available ]]; then
-    cat > "$NCONF" <<NG
-server {
-    listen ${NGINX_LISTEN_PORT};
-    server_name ${NGINX_SERVER_NAME};
-
-    root ${WEBROOT};
-    index index.html;
-
-    # Serve app
-    location / {
-        try_files \$uri /index.html;
-    }
-
-    # Proxy API
-    location /api/ {
-        proxy_pass http://127.0.0.1:${APP_PORT}/;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    # Proxy WS
-    location /ws {
-        proxy_pass http://127.0.0.1:${APP_PORT}/ws;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-}
-NG
-    ln -sf "$NCONF" /etc/nginx/sites-enabled/freepbx-agent-ui.conf
-    if [[ -f /etc/nginx/sites-enabled/default ]]; then rm -f /etc/nginx/sites-enabled/default; fi
-  else
-    # RHEL-style single nginx.conf include
-    cat > /etc/nginx/conf.d/freepbx-agent-ui.conf <<NG
-server {
-    listen ${NGINX_LISTEN_PORT};
-    server_name ${NGINX_SERVER_NAME};
-    root ${WEBROOT};
-    index index.html;
-
-    location / {
-        try_files \$uri /index.html;
-    }
-    location /api/ {
-        proxy_pass http://127.0.0.1:${APP_PORT}/;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-    location /ws {
-        proxy_pass http://127.0.0.1:${APP_PORT}/ws;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-}
-NG
-  fi
-  nginx -t
-  systemctl reload nginx
-fi
-
-# ---------- systemd service ----------
-cyan "==> Creating systemd service..."
+# ----------------------- systemd service -----------------------
+cyan "==> Creating systemd service"
 cat > /etc/systemd/system/freepbx-agent-ui.service <<SVC
 [Unit]
 Description=FreePBX Agent UI API (Node.js)
@@ -935,7 +852,6 @@ Restart=always
 RestartSec=5
 User=${APP_USER}
 Group=${APP_GROUP}
-# Harden a bit
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
@@ -945,29 +861,102 @@ WantedBy=multi-user.target
 SVC
 
 systemctl daemon-reload
-systemctl enable --now freepbx-agent-ui.service
+systemctl enable --now freepbx-agent-ui
 
-# ---------- UFW (optional) ----------
-if command -v ufw >/dev/null 2>&1; then
-  if confirm "Open firewall for HTTP (${NGINX_LISTEN_PORT:-80})?"; then
-    ufw allow "${NGINX_LISTEN_PORT:-80}"/tcp || true
-  fi
-fi
-
-green "==> Done!"
-echo
-echo "Install dir:         ${INSTALL_DIR}"
-echo "API port:            ${APP_PORT}"
-echo "Web URL:"
+# ----------------------- Optional Nginx -----------------------
 if $INSTALL_NGINX; then
-  echo "  http://${NGINX_SERVER_NAME}:${NGINX_LISTEN_PORT}"
-  echo "  (VITE_API pointing to ${VITE_API})"
-else
-  echo "  Build is in: ${INSTALL_DIR}/web/dist"
-  echo "  Serve it via Nginx/your proxy; point VITE_API to http://<server>:${APP_PORT}/api"
+  cyan "==> Installing & configuring Nginx"
+  case "$PKG" in
+    apt) apt install -y nginx ;;
+    dnf) dnf install -y nginx; systemctl enable nginx; systemctl start nginx ;;
+    yum) yum install -y nginx; systemctl enable nginx; systemctl start nginx ;;
+  esac
+
+  WEBROOT="/var/www/freepbx-agent-ui"
+  rm -rf "$WEBROOT"
+  mkdir -p "$WEBROOT"
+  cp -r "$INSTALL_DIR/web/dist/"* "$WEBROOT/"
+  chown -R "$APP_USER:$APP_GROUP" "$WEBROOT"
+
+  if [[ -d /etc/nginx/sites-available ]]; then
+    NCONF="/etc/nginx/sites-available/freepbx-agent-ui.conf"
+    cat > "$NCONF" <<NG
+server {
+    listen ${NGINX_LISTEN_PORT};
+    server_name ${NGINX_SERVER_NAME};
+
+    root ${WEBROOT};
+    index index.html;
+
+    location / { try_files \$uri /index.html; }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:${APP_PORT}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    location /ws {
+        proxy_pass http://127.0.0.1:${APP_PORT}/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+}
+NG
+    ln -sf "$NCONF" /etc/nginx/sites-enabled/freepbx-agent-ui.conf
+    rm -f /etc/nginx/sites-enabled/default || true
+  else
+    cat > /etc/nginx/conf.d/freepbx-agent-ui.conf <<NG
+server {
+    listen ${NGINX_LISTEN_PORT};
+    server_name ${NGINX_SERVER_NAME};
+
+    root ${WEBROOT};
+    index index.html;
+
+    location / { try_files \$uri /index.html; }
+    location /api/ {
+        proxy_pass http://127.0.0.1:${APP_PORT}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    location /ws {
+        proxy_pass http://127.0.0.1:${APP_PORT}/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+}
+NG
+  fi
+
+  nginx -t
+  systemctl reload nginx
 fi
+
+# ----------------------- Health checks -----------------------
+cyan "==> Health checks"
+sleep 1
+if ss -lntp | grep -q ":${APP_PORT}"; then
+  green "API is listening on :${APP_PORT}"
+else
+  yellow "API not detected on :${APP_PORT} yet. Check logs: journalctl -u freepbx-agent-ui -f"
+fi
+
 echo
-echo "Systemd service:     freepbx-agent-ui  (logs: journalctl -u freepbx-agent-ui -f)"
-echo "If AMI/MySQL schemas differ from the defaults, adjust queries in:"
-echo "  - ${INSTALL_DIR}/server/src/sla.js"
-echo "  - ${INSTALL_DIR}/server/src/agentStats.js"
+echo "Try a quick API probe (401 is OK):"
+echo "  curl -i http://127.0.0.1:${APP_PORT}/api/queues"
+echo
+$INSTALL_NGINX && echo "Open: http://${NGINX_SERVER_NAME}:${NGINX_LISTEN_PORT}"
+echo "Service logs: journalctl -u freepbx-agent-ui -f"
+echo
+green "==> Done. Edit ${INSTALL_DIR}/server/.env or ${INSTALL_DIR}/server/src/config.js and restart: systemctl restart freepbx-agent-ui"
