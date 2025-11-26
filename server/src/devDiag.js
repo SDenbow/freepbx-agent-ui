@@ -3,6 +3,8 @@ import { getAMI, amiCommand } from "./ami.js";
 import { discoverQueuesForExt } from "./queueDiscovery.js";
 
 export default fp(async (fastify) => {
+  fastify.get("/healthz", async () => ({ ok: true }));
+  fastify.get("/healthz/ami", async () => ({ ami: !!getAMI() }));
 
   fastify.get("/api/dev/ami-test", { preHandler: fastify.auth }, async () => {
     const out = {};

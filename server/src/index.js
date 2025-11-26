@@ -2,7 +2,7 @@ import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { buildAuth } from "./auth.js";
-import { connectAMI, amiStatus, queueAdd, queueRemove, queuePause } from "./ami.js";
+import { connectAMI, getAMI, queueAdd, queueRemove, queuePause } from "./ami.js";
 import { discoverQueuesForExt, ifacesForExt } from "./queueDiscovery.js";
 import devDiag from "./devDiag.js";
 
@@ -12,7 +12,7 @@ buildAuth(fastify);
 await fastify.register(devDiag);
 
 fastify.get("/healthz", async () => ({ ok: true }));
-fastify.get("/healthz/ami", async () => amiStatus());
+fastify.get("/healthz/ami", async () => ({ ami: !!getAMI() }));
 
 fastify.addHook("preHandler", async (req, rep) => {
   const p = req.routerPath || req.url || "";
@@ -62,13 +62,13 @@ fastify.post("/api/queue/unpause", async (req, rep) => {
 });
 
 async function start() {
+  const port = +(process.env.PORT || 8088);
+  await fastify.listen({ port, host: "0.0.0.0" });
+  fastify.log.info("API on :" + port);
   try {
     await connectAMI();
   } catch (e) {
     fastify.log.error({ err: e }, "AMI connect error (continuing without AMI)");
   }
-  const port = +(process.env.PORT || 8088);
-  await fastify.listen({ port, host: "0.0.0.0" });
-  fastify.log.info("API on :" + port);
 }
 start().catch((e) => { console.error(e); process.exit(1); });

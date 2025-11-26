@@ -1,5 +1,5 @@
 import mysql from "mysql2/promise";
-import { amiCommand, getAMI, isAMIConnected } from "./ami.js";
+import { amiCommand, getAMI } from "./ami.js";
 
 const pool = mysql.createPool({
   host: process.env.MYSQL_CFG_HOST || process.env.MYSQL_HOST || "127.0.0.1",
@@ -61,63 +61,75 @@ async function allowedAgentsFromAstDB(q) {
   return agents;
 }
 
-async function collectQueueStatus(ext, allowedQs) {
+async function isLoggedIn(ext, q) {
   const ami = getAMI();
-  const loggedIn = {}, paused = {};
-  allowedQs.forEach((q) => { loggedIn[q] = false; paused[q] = false; });
+  if (!ami) return false;
 
-  if (!ami) return { loggedIn, paused };
+  try {
+    const pm = await amiCommand(`database show Queue/PersistentMembers/${q}`);
+    const rx = new RegExp(`(?:SIP|PJSIP)/${ext}\\b`);
+    if (rx.test(pm) || pm.includes(`/${ext}`) || pm.includes(`;${ext};`)) return true;
+  } catch {}
 
+  // fallback: QueueStatus scan
   return await new Promise((resolve) => {
-    const allowedSet = new Set(allowedQs);
-    const pending = new Set(allowedQs);
+    let logged = false;
     const onEv = (evt) => {
       const ev = (evt.Event || "").toUpperCase();
       if (ev === "QUEUEMEMBER") {
-        const q = evt.Queue;
-        if (!allowedSet.has(q)) return;
+        if (evt.Queue !== q) return;
         const si = (evt.StateInterface || evt.Interface || "");
-        const matchesExt = si.includes(`SIP/${ext}`) || si.includes(`PJSIP/${ext}`) || si.endsWith(`/${ext}`);
-        if (matchesExt) {
-          loggedIn[q] = true;
-          paused[q] = String(evt.Paused || "0") === "1";
-        }
+        if (si.includes(`SIP/${ext}`) || si.includes(`PJSIP/${ext}`) || si.endsWith(`/${ext}`)) logged = true;
       } else if (ev === "QUEUESTATUSCOMPLETE") {
-        const q = evt.Queue || "";
-        pending.delete(q);
-        if (pending.size === 0) cleanup();
+        ami.removeListener("managerevent", onEv);
+        resolve(logged);
       }
     };
-    const cleanup = () => {
-      ami.removeListener("managerevent", onEv);
-      resolve({ loggedIn, paused });
-    };
-
     ami.on("managerevent", onEv);
-    allowedQs.forEach((q) => ami.action({ Action: "QueueStatus", Queue: q }, () => {}));
-    setTimeout(cleanup, 2000);
+    ami.action({ Action:"QueueStatus", Queue:q }, () => {});
+    setTimeout(() => { ami.removeListener("managerevent", onEv); resolve(logged); }, 2000);
+  });
+}
+
+async function isPaused(ext, q) {
+  const ami = getAMI();
+  if (!ami) return false;
+  return await new Promise((resolve) => {
+    let paused = false;
+    const onEv = (evt) => {
+      const ev = (evt.Event || "").toUpperCase();
+      if (ev === "QUEUEMEMBER") {
+        if (evt.Queue !== q) return;
+        const si = (evt.StateInterface || evt.Interface || "");
+        const isMine = si.includes(`SIP/${ext}`) || si.includes(`PJSIP/${ext}`) || si.endsWith(`/${ext}`);
+        if (isMine) paused = String(evt.Paused||"0") === "1";
+      } else if (ev === "QUEUESTATUSCOMPLETE") {
+        ami.removeListener("managerevent", onEv);
+        resolve(paused);
+      }
+    };
+    ami.on("managerevent", onEv);
+    ami.action({ Action:"QueueStatus", Queue:q }, () => {});
+    setTimeout(() => { ami.removeListener("managerevent", onEv); resolve(paused); }, 2000);
   });
 }
 
 export async function discoverQueuesForExt(ext) {
   const allQueues = await getQueuesFromDB();
-  const results = await Promise.all(allQueues.map(async (q) => {
+  const allowedQs = [];
+  for (const q of allQueues) {
     const dyn = await dynFromAstDB(q);
-    if (!dyn) return { q, allowed: true };
+    if (!dyn) { allowedQs.push(q); continue; }
     const agents = await allowedAgentsFromAstDB(q);
-    return { q, allowed: agents.has(String(ext)) };
-  }));
+    if (agents.has(String(ext))) allowedQs.push(q);
+  }
 
-  const allowedQs = results.filter((r) => r.allowed).map((r) => r.q);
-  const status = isAMIConnected() ? await collectQueueStatus(ext, allowedQs) : { loggedIn: {}, paused: {} };
-  const loggedIn = status.loggedIn || {};
-  const paused = status.paused || {};
-
-  allowedQs.forEach((q) => {
-    if (!(q in loggedIn)) loggedIn[q] = false;
-    if (!(q in paused)) paused[q] = false;
-  });
-
+  // status maps only for allowed queues
+  const loggedIn = {}, paused = {};
+  for (const q of allowedQs) {
+    try { loggedIn[q] = await isLoggedIn(ext, q); } catch { loggedIn[q] = false; }
+    try { paused[q]   = await isPaused(ext, q);   } catch { paused[q]   = false; }
+  }
   return { allQueues, allowedQs, loggedIn, paused };
 }
 
