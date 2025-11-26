@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>FreePBX Agent UI</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0b0e12; color:#e6e9ef; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:20px; }
+  .card { background:#10151d; border:1px solid #1c2430; border-radius:12px; padding:16px; margin:12px 0; }
+  input,button { border-radius:8px; padding:8px 12px; border:1px solid #293548; background:#0f141b; color:#e6e9ef; }
+  button { cursor:pointer; }
+  .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap;}
+  .tag { font-size:12px; padding:2px 8px; border-radius:12px; display:inline-block; }
+  .ok { background:#16331c; color:#7ad37a; border:1px solid #255b2a; }
+  .bad{ background:#3a1616; color:#ff7b7b; border:1px solid #6b2323; }
+  .pill{ padding:2px 8px; border-radius:999px; font-size:12px; }
+  table { width:100%; border-collapse: collapse; }
+  th,td{ padding:12px; border-bottom:1px solid #1c2430; }
+  th{ text-align:left; color:#b9c2cf; font-weight:600; }
+  .status { display:flex; align-items:center; gap:8px; }
+  .dot{ width:10px; height:10px; border-radius:50%; display:inline-block; }
+  .red{ background:#ff4d4d; } .green{ background:#33dd88; } .amber{ background:#f3b94a; }
+  .muted{ color:#8fa2b7; }
+  .right{ margin-left:auto; }
+</style>
+</head>
+<body>
+  <h1>FreePBX Agent UI</h1>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <div class="muted">Username</div>
+        <input id="u" placeholder="userman username or extension" />
+      </div>
+      <div>
+        <div class="muted">Password</div>
+        <input id="p" type="password" placeholder="password" />
+      </div>
+      <button onclick="login()">Login</button>
+      <button onclick="logout()">Logout</button>
+      <div class="right muted">Token: <code id="tok" class="muted"></code></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>API health: <span id="health" class="tag">…</span></div>
+      <div>AMI: <span id="ami" class="tag">unknown</span></div>
+      <button class="right" onclick="refresh()">Refresh now</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <h3>Queues & status</h3>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Queue</th><th>Status</th><th class="right">Actions</th></tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+<script>
+const api = (p)=> '/api' + p;
+let token = '';
+
+function setTag(el, ok){
+  el.textContent = ok ? 'OK' : 'down';
+  el.className = 'tag ' + (ok?'ok':'bad');
+}
+
+async function ping(){
+  try{
+    const r = await fetch('/healthz');
+    setTag(document.getElementById('health'), r.ok);
+  }catch{ setTag(document.getElementById('health'), false); }
+
+  try{
+    const j = await (await fetch('/healthz/ami')).json();
+    const el = document.getElementById('ami');
+    el.textContent = j.ami ? 'connected' : 'not connected';
+    el.className = 'tag ' + (j.ami?'ok':'bad');
+  }catch{
+    const el = document.getElementById('ami');
+    el.textContent = 'unknown'; el.className = 'tag bad';
+  }
+}
+
+function auth(){ return token ? { 'Authorization':'Bearer '+token } : {}; }
+
+async function login(){
+  const username = document.getElementById('u').value.trim();
+  const password = document.getElementById('p').value;
+  const r = await fetch(api('/login'), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username,password})});
+  const j = await r.json();
+  if (j.token){ token=j.token; document.getElementById('tok').textContent = token.slice(0,24)+'…'; await refresh(true); }
+  else alert(j.error||'login failed');
+}
+async function logout(){
+  token = ''; document.getElementById('tok').textContent='';
+  document.getElementById('tbody').innerHTML='';
+  await fetch(api('/logout'), {method:'POST', headers:auth()}).catch(()=>{});
+}
+
+function statusCell(logged, paused){
+  if (!logged) return '<div class="status"><span class="dot red"></span> Not logged in</div>';
+  if (paused)  return '<div class="status"><span class="dot amber"></span> Paused</div>';
+  return '<div class="status"><span class="dot green"></span> Logged in</div>';
+}
+
+async function doAction(act, q){
+  if (!token) return alert('login first');
+  try{
+    const r = await fetch(api('/queue/'+act), { method:'POST', headers:{...auth(),'Content-Type':'application/json'}, body: JSON.stringify({queue:q}) });
+    await r.json();
+    await new Promise(r=>setTimeout(r, 1000)); // let AMI settle
+    await refresh();
+  }catch(e){ alert(e); }
+}
+
+async function refresh(silent){
+  if (!token) return;
+  try{
+    const j = await (await fetch(api('/queues'), {headers:auth()})).json();
+    const allowed = (j.allowedQs||[]); // only render these
+    const tbody = document.getElementById('tbody');
+    tbody.innerHTML = '';
+    for (const q of allowed){
+      const logged = !!(j.loggedIn||{})[q];
+      const paused = !!(j.paused||{})[q];
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td>${q}</td>
+        <td>${statusCell(logged, paused)}</td>
+        <td class="right">
+          <button onclick="doAction('login','${q}')">Login</button>
+          <button onclick="doAction('logout','${q}')">Logout</button>
+          <button onclick="doAction('pause','${q}')">Pause</button>
+          <button onclick="doAction('unpause','${q}')">Unpause</button>
+        </td>`;
+      tbody.appendChild(row);
+    }
+    if (!silent) console.log('refreshed');
+  }catch(e){ if(!silent) alert(e); }
+}
+
+ping();
+setInterval(ping, 5000);
+setInterval(()=>refresh(true), 3000);
+</script>
+</body></html>
